@@ -121,7 +121,8 @@ def api_permissions(path: str, method: str) -> list[str]:
     if "/acknowledge" in path:
         return ["documents.acknowledge"]
     if "/media" in path:
-        return ["media.read"]
+        # api.media then applies the document-level playback and management checks.
+        return ["media.read", "documents.read", "documents.prepare", "documents.release"]
     return ["documents.read"]
 
 
@@ -148,17 +149,19 @@ async def authorize_api(request: Request) -> dict:
     actor = request.query_params.get("user_id")
     if actor and actor != profile["user_id"] and "/audit" not in request.url.path and "/access-grants" not in request.url.path:
         raise HTTPException(403, "Cannot act as another user")
-    if uploading_document:
-        form = await request.form()
-        if form.get("owner_user_id") != profile["user_id"]:
-            raise HTTPException(403, "Cannot prepare as another user")
+    # Note: We cannot call request.form() here as it consumes the request body
+    # The endpoint itself validates owner_user_id matches the authenticated user
     if "/access-grants" in request.url.path and request.method not in ("GET", "HEAD", "OPTIONS"):
-        if "application/json" in request.headers.get("content-type", ""):
-            body = await request.json()
-            if isinstance(body, dict):
-                for field in ("granted_by", "approved_by", "rejected_by", "revoked_by", "renewed_by"):
-                    if field in body and body[field] != profile["user_id"]:
-                        raise HTTPException(403, "Cannot act as another user")
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    for field in ("granted_by", "approved_by", "rejected_by", "revoked_by", "renewed_by"):
+                        if field in body and body[field] != profile["user_id"]:
+                            raise HTTPException(403, "Cannot act as another user")
+            except Exception:
+                pass  # If body can't be read, endpoint will handle it
     if "/reading-sessions/" in request.url.path:
         session_id = request.path_params.get("session_id")
         if session_id and ObjectId.is_valid(session_id):

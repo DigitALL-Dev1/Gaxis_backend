@@ -1,6 +1,7 @@
 """Lumen development API. Replace bootstrap auth with GAXIS M1 for production."""
 import os
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, status
+from fastapi.responses import JSONResponse
 from api.session_security import authorize_api
 from fastapi.middleware.cors import CORSMiddleware
 from api.auth import router as auth_router
@@ -14,6 +15,7 @@ from api.access_grants import router as access_grants_router
 from api.document_reader import router as document_reader_router
 from api.media import router as media_router
 from dotenv import load_dotenv
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -21,14 +23,36 @@ load_dotenv()
 # Create FastAPI app
 app = FastAPI(title="Gaxis Lumen API", version="1.0.0")
 
+# Global exception handler for better debugging
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"Global exception handler caught: {type(exc).__name__}")
+    print(f"Error: {str(exc)}")
+    print(f"Traceback: {traceback.format_exc()}")
+    
+    # Return proper error response
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": f"Internal server error: {str(exc)}",
+            "type": type(exc).__name__
+        },
+        headers={
+            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
+
 # CORS configuration
-FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "").split(",")
+FRONTEND_ORIGINS = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # Include routers

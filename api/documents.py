@@ -294,43 +294,72 @@ async def save_version(document_id: str, actor: str, version_number: str, change
 
 @router.post("/documents/prepare")
 async def prepare_document(request: Request, title: str = Form(...), reference: str = Form(...), family_id: str = Form(...), owner_user_id: str = Form(...), classification: str = Form(...), reader_class_ids: str = Form(...), version_number: str = Form(...), acknowledgement_required: bool = Form(...), change_summary: str = Form(""), file: UploadFile = File(...)):
-    actor = await preparation_actor(request, owner_user_id)
-    await validate_family_authorization(actor, family_id)
-    validate_version_number(version_number)
-    reference = reference.strip().upper()
-    if not title.strip() or len(reference) < 5:
-        raise HTTPException(400, "Enter a title and a document reference of at least five characters")
-    if classification not in ("D2", "D3"):
-        raise HTTPException(400, "Classification must be D2 or D3")
-    reader_ids = list(dict.fromkeys(value.strip() for value in reader_class_ids.split(",") if value.strip()))
-    if not reader_ids:
-        raise HTTPException(400, "At least one active reader class is required")
-    for reader_id in reader_ids:
-        reader = await reader_classes_collection.find_one({"_id": oid(reader_id, "reader class")})
-        if not reader or not reader.get("is_active", False):
-            raise HTTPException(400, "Select active reader classes from the database")
-    if await documents_collection.find_one({"reference": reference}):
-        raise HTTPException(409, "This document reference already exists. Upload a revised version instead.")
-    await documents_collection.create_index("reference", unique=True, sparse=True)
-    await document_versions_collection.create_index([("document_id", 1), ("version_number", 1)], unique=True)
-    document = {
-        "title": title.strip(), "reference": reference, "family_id": family_id, "owner_user_id": actor,
-        "classification": classification, "reader_class_ids": reader_ids, "current_version_id": None,
-        "acknowledgement_required": acknowledgement_required, "is_active": True, "created_by": actor,
-        "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
-    }
-    document_id = None
     try:
-        result = await documents_collection.insert_one(document)
-        document_id = str(result.inserted_id)
-        version_id = await save_version(document_id, actor, version_number, change_summary, file)
-    except Exception as error:
-        if document_id:
-            await documents_collection.delete_one({"_id": ObjectId(document_id)})
-        if isinstance(error, DuplicateKeyError):
-            raise HTTPException(409, "The document reference or version already exists")
+        actor = await preparation_actor(request, owner_user_id)
+        await validate_family_authorization(actor, family_id)
+        validate_version_number(version_number)
+        reference = reference.strip().upper()
+        if not title.strip() or len(reference) < 5:
+            raise HTTPException(400, "Enter a title and a document reference of at least five characters")
+        if classification not in ("D2", "D3"):
+            raise HTTPException(400, "Classification must be D2 or D3")
+        reader_ids = list(dict.fromkeys(value.strip() for value in reader_class_ids.split(",") if value.strip()))
+        if not reader_ids:
+            raise HTTPException(400, "At least one active reader class is required")
+        for reader_id in reader_ids:
+            reader = await reader_classes_collection.find_one({"_id": oid(reader_id, "reader class")})
+            if not reader or not reader.get("is_active", False):
+                raise HTTPException(400, "Select active reader classes from the database")
+        if await documents_collection.find_one({"reference": reference}):
+            raise HTTPException(409, "This document reference already exists. Upload a revised version instead.")
+        
+        # Create indexes only if they don't exist (idempotent)
+        try:
+            # Check existing indexes
+            existing_indexes = await documents_collection.index_information()
+            if "reference_1" not in existing_indexes:
+                await documents_collection.create_index("reference", unique=True, sparse=True, name="reference_1")
+        except Exception as idx_error:
+            # Index might already exist, which is fine
+            print(f"Index creation note: {idx_error}")
+        
+        try:
+            existing_version_indexes = await document_versions_collection.index_information()
+            if "document_id_1_version_number_1" not in existing_version_indexes:
+                await document_versions_collection.create_index(
+                    [("document_id", 1), ("version_number", 1)], 
+                    unique=True,
+                    name="document_id_1_version_number_1"
+                )
+        except Exception as idx_error:
+            # Index might already exist, which is fine
+            print(f"Version index creation note: {idx_error}")
+        
+        document = {
+            "title": title.strip(), "reference": reference, "family_id": family_id, "owner_user_id": actor,
+            "classification": classification, "reader_class_ids": reader_ids, "current_version_id": None,
+            "acknowledgement_required": acknowledgement_required, "is_active": True, "created_by": actor,
+            "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
+        }
+        document_id = None
+        try:
+            result = await documents_collection.insert_one(document)
+            document_id = str(result.inserted_id)
+            version_id = await save_version(document_id, actor, version_number, change_summary, file)
+        except Exception as error:
+            if document_id:
+                await documents_collection.delete_one({"_id": ObjectId(document_id)})
+            if isinstance(error, DuplicateKeyError):
+                raise HTTPException(409, "The document reference or version already exists")
+            raise
+        return {"message": "Document prepared successfully", "document_id": document_id, "version_id": version_id, "status": "UNDER_REVIEW", "title": document["title"], "reference": reference, "version_number": version_number.strip(), "prepared_by": actor}
+    except HTTPException:
         raise
-    return {"message": "Document prepared successfully", "document_id": document_id, "version_id": version_id, "status": "UNDER_REVIEW", "title": document["title"], "reference": reference, "version_number": version_number.strip(), "prepared_by": actor}
+    except Exception as e:
+        import traceback
+        print(f"Error in prepare_document: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 
 # Static collection routes must precede /documents/{document_id}.

@@ -146,6 +146,18 @@ class UserSessionTests(unittest.TestCase):
         self.role["is_active"] = False
         self.assertEqual(self.client.get("/api/v1/auth/me").json()["roles"], [])
 
+    def test_media_routes_accept_the_document_permissions_used_by_the_media_module(self):
+        for path, method in [
+            ("/api/v1/lumen/media", "GET"),
+            ("/api/v1/lumen/media/asset/stream", "GET"),
+            ("/api/v1/lumen/media/asset/captions/review", "POST"),
+            ("/api/v1/lumen/media/playback/session/progress", "POST"),
+        ]:
+            needed = security.api_permissions(path, method)
+            for permission in ("documents.read", "documents.prepare", "documents.release"):
+                self.assertIn(permission, needed)
+        self.assertEqual(security.api_permissions("/api/v1/lumen/media/prepare", "POST"), ["documents.prepare"])
+
     def test_disabled_users_reader_classes_and_expired_sessions_lose_access(self):
         self.login()
         self.user["status"] = "INACTIVE"

@@ -16,6 +16,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import subprocess
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -69,6 +70,10 @@ def stored(key):
 
 
 async def current_user(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer)):
+    if getattr(request.state, "bootstrap_admin", False):
+        # No user record or reader class exists, so playback checks deny this identity.
+        email = request.state.actor_email
+        return {"_id": "bootstrap:" + email, "email": email, "status": "ACTIVE", "bootstrap_admin": True}
     subject = getattr(request.state, "user_id", None)
     if subject is None:
         if not credentials:
@@ -136,6 +141,8 @@ async def management_access(asset, user):
     doc = await db.documents.find_one({"_id": asset["document_id"]})
     if not doc:
         raise HTTPException(404, "Controlled item not found")
+    if user.get("bootstrap_admin"):
+        return doc
     family = await db.document_families.find_one({"_id": oid(doc["family_id"])})
     allowed = await permissions(user)
     owner = str(doc.get("owner_user_id")) == str(user["_id"])
@@ -237,19 +244,15 @@ async def validate_media_release(version_id, releaser_id, *, admin_actor=None):
 
 
 async def run_command(*args):
+    # A worker thread is used because Uvicorn's reload mode on Windows runs a selector
+    # event loop, where asyncio subprocesses raise NotImplementedError.
     try:
-        process = await asyncio.create_subprocess_exec(*map(str, args), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        result = await asyncio.to_thread(subprocess.run, [str(arg) for arg in args], stdin=subprocess.DEVNULL, capture_output=True, timeout=14400)
     except FileNotFoundError:
         raise RuntimeError("FFmpeg and ffprobe must be installed")
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=14400)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        process.kill()
-        await process.wait()
-        raise
-    if process.returncode:
-        raise RuntimeError(stderr.decode(errors="replace")[-1500:])
-    return stdout
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode(errors="replace")[-1500:] or f"{args[0]} exited with code {result.returncode}")
+    return result.stdout
 
 
 async def probe(path, media_type):
@@ -334,8 +337,16 @@ async def prepare_media(background: BackgroundTasks, title: str = Form(..., min_
                         document_id: Optional[str] = Form(None), external_url: Optional[str] = Form(None),
                         safety_or_induction: bool = Form(False), file: Optional[UploadFile] = File(None),
                         user: dict = Depends(current_user)):
-    await require(user, "documents.prepare")
+    admin_email = user["email"] if user.get("bootstrap_admin") else None
+    if not admin_email:
+        await require(user, "documents.prepare")
     family = await db.document_families.find_one({"_id": oid(family_id), "is_active": True})
+    if admin_email and family:
+        # As with documents, an administrator prepares on behalf of the assigned owner.
+        owner_id = str(family.get("owner_user_id"))
+        user = await db.users.find_one({"_id": oid(owner_id)}) if ObjectId.is_valid(owner_id) else None
+        if not user or user.get("status", "").upper() != "ACTIVE":
+            raise HTTPException(403, "The document family needs an active owner")
     if not family or str(family.get("owner_user_id")) != str(user["_id"]):
         raise HTTPException(403, "Only the active document family owner can prepare media")
     rc_ids = list(dict.fromkeys(oid(x.strip()) for x in reader_class_ids.split(",") if x.strip()))
@@ -406,7 +417,7 @@ async def prepare_media(background: BackgroundTasks, title: str = Form(..., min_
     finally:
         if file:
             await file.close()
-    await audit(user, "MEDIA_PREPARED", asset)
+    await audit(user, "MEDIA_PREPARED", asset, **({"acting_administrator": admin_email} if admin_email else {}))
     if not reference_only:
         background.add_task(process_asset, str(asset_id))
     return {"message": "Media uploaded successfully", "media_asset_id": str(asset_id), "document_id": str(doc_id), "version_id": str(version_id), "processing_status": asset["processing_status"], "publication_status": "UNDER_REVIEW"}
